@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"os"
@@ -8,8 +9,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
+	"reflect"
+	"io/ioutil"
 
-	"github.com/holys/goredis"
+	"github.com/go-redis/redis"
 	"github.com/peterh/liner"
 )
 
@@ -24,12 +28,10 @@ var (
 )
 
 var (
-	line        *liner.State
-	historyPath = path.Join(os.Getenv("HOME"), ".gorediscli_history") // $HOME/.gorediscli_history
-
 	mode int
-
-	client *goredis.Client
+	line        *liner.State
+	client *redis.ClusterClient
+	historyPath = path.Join(os.Getenv("HOME"), ".gorediscli_history") // $HOME/.gorediscli_history
 )
 
 //output
@@ -100,6 +102,7 @@ func repl() {
 		if len(cmds) == 0 {
 			continue
 		} else {
+			
 			appendHistory(cmds)
 
 			cmd := strings.ToLower(cmds[0])
@@ -114,7 +117,7 @@ func repl() {
 			} else if cmd == "mode" {
 				switchMode(cmds[1:])
 			} else {
-				cliSendCommand(cmds)
+				cliSendCommand(cmds...)
 			}
 		}
 	}
@@ -137,42 +140,38 @@ func appendHistory(cmds []string) {
 	line.AppendHistory(strings.Join(cloneCmds, " "))
 }
 
-func cliSendCommand(cmds []string) {
+func cliSendCommand(cmds ...string) {
 	cliConnect()
 
 	if len(cmds) == 0 {
 		return
 	}
 
-	args := make([]interface{}, len(cmds[1:]))
-	for i := range args {
-		args[i] = strings.Trim(string(cmds[1+i]), "\"'")
-	}
-
-	cmd := strings.ToLower(cmds[0])
-
-	if cmd == "monitor" {
-		respChan := make(chan interface{})
-		stopChan := make(chan struct{})
-		err := client.Monitor(respChan, stopChan)
+	loadedScript := false
+	if len(cmds) > 1 && cmds[1] == "--script" {
+		content, err := ioutil.ReadFile(cmds[2])
 		if err != nil {
 			fmt.Printf("(error) %s\n", err.Error())
 			return
 		}
-		for {
-			select {
-			case mr := <-respChan:
-				printReply(0, mr, mode)
-				fmt.Printf("\n")
-			case <-stopChan:
-				fmt.Println("Error: Server closed the connection")
-				return
-			}
-		}
-
+		cmds[2] = string(content)
+	
+		loadedScript = true
 	}
 
-	r, err := client.Do(cmd, args...)
+	args := make([]interface{}, len(cmds))
+	x := 0
+	for i := range args {
+		if loadedScript && i == 1 {
+			continue
+		}
+		args[x] = strings.Trim(cmds[i], "\"'")
+		x = x + 1
+	}
+
+	cmd := strings.ToLower(cmds[0])
+	
+	r, err := client.Do(args...).Result()
 	if err == nil && strings.ToLower(cmd) == "select" {
 		*dbn, _ = strconv.Atoi(cmds[1])
 	}
@@ -184,6 +183,10 @@ func cliSendCommand(cmds []string) {
 		} else {
 			printReply(0, r, mode)
 		}
+
+		if cmd == "eval" {
+			fmt.Printf("\nSize of result: %v", SizeOf(r))
+		} 
 	}
 
 	fmt.Printf("\n")
@@ -192,11 +195,18 @@ func cliSendCommand(cmds []string) {
 func cliConnect() {
 	if client == nil {
 		addr := addr()
-		client = goredis.NewClient(addr, "")
-		client.SetMaxIdleConns(1)
+		client = redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:        []string{addr},
+			Password:     *auth,
+			TLSConfig:    &tls.Config{},
+			PoolSize:     3,
+			DialTimeout:  time.Second * 10,
+			ReadTimeout:  time.Second * 10,
+			WriteTimeout: time.Second * 10,
+		})
+
 		sendPing(client)
 		sendSelect(client, *dbn)
-		sendAuth(client, *auth)
 	}
 }
 
@@ -216,7 +226,15 @@ func reconnect(args []string) {
 
 	if h != "" && p != "" {
 		addr := fmt.Sprintf("%s:%s", h, p)
-		client = goredis.NewClient(addr, "")
+		client = redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:        []string{addr},
+			Password:     auth,
+			TLSConfig:    &tls.Config{},
+			PoolSize:     3,
+			DialTimeout:  time.Second * 10,
+			ReadTimeout:  time.Second * 10,
+			WriteTimeout: time.Second * 10,
+		})
 	}
 
 	if err := sendPing(client); err != nil {
@@ -270,7 +288,7 @@ func addr() string {
 }
 
 func noninteractive(args []string) {
-	cliSendCommand(args)
+	cliSendCommand(args...)
 }
 
 func printInfo(reply interface{}) {
@@ -278,8 +296,8 @@ func printInfo(reply interface{}) {
 	case []byte:
 		fmt.Printf("%s", reply)
 	//some redis proxies don't support this command.
-	case goredis.Error:
-		fmt.Printf("(error) %s", string(reply))
+	case error:
+		fmt.Printf("(error) %s", reply.Error())
 	}
 }
 
@@ -305,8 +323,8 @@ func printStdReply(level int, reply interface{}) {
 		fmt.Printf("%q", reply)
 	case nil:
 		fmt.Printf("(nil)")
-	case goredis.Error:
-		fmt.Printf("(error) %s", string(reply))
+	case error:
+		fmt.Printf("%s\n", reply.Error())
 	case []interface{}:
 		for i, v := range reply {
 			if i != 0 {
@@ -336,8 +354,8 @@ func printRawReply(level int, reply interface{}) {
 		fmt.Printf("%s", reply)
 	case nil:
 		// do nothing
-	case goredis.Error:
-		fmt.Printf("%s\n", string(reply))
+	case error:
+		fmt.Printf("%s\n", reply.Error())
 	case []interface{}:
 		for i, v := range reply {
 			if i != 0 {
@@ -385,7 +403,7 @@ func printHelp(cmds []string) {
 	}
 }
 
-func sendSelect(client *goredis.Client, index int) {
+func sendSelect(client *redis.ClusterClient, index int) {
 	if index == 0 {
 		// do nothing
 		return
@@ -394,26 +412,26 @@ func sendSelect(client *goredis.Client, index int) {
 		index = 0
 		fmt.Println("index out of range, should less than 16")
 	}
-	_, err := client.Do("SELECT", index)
+	_, err := client.Do("SELECT", index).Result()
 	if err != nil {
 		fmt.Printf("%s\n", err.Error())
 	}
 }
 
-func sendAuth(client *goredis.Client, passwd string) error {
+func sendAuth(client *redis.ClusterClient, passwd string) error {
 	if passwd == "" {
 		// do nothing
 		return nil
 	}
 
-	resp, err := client.Do("AUTH", passwd)
+	resp, err := client.Do("AUTH", passwd).Result()
 	if err != nil {
 		fmt.Printf("(error) %s\n", err.Error())
 		return err
 	}
 
 	switch resp := resp.(type) {
-	case goredis.Error:
+	case error:
 		fmt.Printf("(error) %s\n", resp.Error())
 		return resp
 	}
@@ -421,8 +439,8 @@ func sendAuth(client *goredis.Client, passwd string) error {
 	return nil
 }
 
-func sendPing(client *goredis.Client) error {
-	_, err := client.Do("PING")
+func sendPing(client *redis.ClusterClient) error {
+	_, err := client.Do("PING").Result()
 	if err != nil {
 		fmt.Printf("%s\n", err.Error())
 		return err
@@ -468,4 +486,108 @@ func showWelcomeMsg() {
 	Usage: MODE [std | raw]
 	`
 	fmt.Println(welcome)
+}
+
+
+
+
+// SizeOf returns the size of 'v' in bytes.
+// If there is an error during calculation, Of returns -1.
+func SizeOf(v interface{}) int {
+	cache := make(map[uintptr]bool) // cache with every visited Pointer for recursion detection
+	return sizeOf(reflect.Indirect(reflect.ValueOf(v)), cache)
+}
+
+// sizeOf returns the number of bytes the actual data represented by v occupies in memory.
+// If there is an error, sizeOf returns -1.
+func sizeOf(v reflect.Value, cache map[uintptr]bool) int {
+
+	switch v.Kind() {
+
+	case reflect.Array:
+		fallthrough
+	case reflect.Slice:
+		// return 0 if this node has been visited already (infinite recursion)
+		if v.Kind() != reflect.Array && cache[v.Pointer()] {
+			return 0
+		}
+		if v.Kind() != reflect.Array {
+			cache[v.Pointer()] = true
+		}
+		sum := 0
+		for i := 0; i < v.Len(); i++ {
+			s := sizeOf(v.Index(i), cache)
+			if s < 0 {
+				return -1
+			}
+			sum += s
+		}
+		return sum + int(v.Type().Size())
+
+	case reflect.Struct:
+		sum := 0
+		for i, n := 0, v.NumField(); i < n; i++ {
+			s := sizeOf(v.Field(i), cache)
+			if s < 0 {
+				return -1
+			}
+			sum += s
+		}
+		return sum
+
+	case reflect.String:
+		return len(v.String()) + int(v.Type().Size())
+
+	case reflect.Ptr:
+		// return Ptr size if this node has been visited already (infinite recursion)
+		if cache[v.Pointer()] {
+			return int(v.Type().Size())
+		}
+		cache[v.Pointer()] = true
+		if v.IsNil() {
+			return int(reflect.New(v.Type()).Type().Size())
+		}
+		s := sizeOf(reflect.Indirect(v), cache)
+		if s < 0 {
+			return -1
+		}
+		return s + int(v.Type().Size())
+
+	case reflect.Bool,
+		reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Int,
+		reflect.Chan,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
+		return int(v.Type().Size())
+
+	case reflect.Map:
+		// return 0 if this node has been visited already (infinite recursion)
+		if cache[v.Pointer()] {
+			return 0
+		}
+		cache[v.Pointer()] = true
+		sum := 0
+		keys := v.MapKeys()
+		for i := range keys {
+			val := v.MapIndex(keys[i])
+			// calculate size of key and value separately
+			sv := sizeOf(val, cache)
+			if sv < 0 {
+				return -1
+			}
+			sum += sv
+			sk := sizeOf(keys[i], cache)
+			if sk < 0 {
+				return -1
+			}
+			sum += sk
+		}
+		return sum + int(v.Type().Size())
+
+	case reflect.Interface:
+		return sizeOf(v.Elem(), cache) + int(v.Type().Size())
+	}
+
+	return -1
 }
